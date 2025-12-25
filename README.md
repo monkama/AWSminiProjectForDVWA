@@ -54,7 +54,7 @@ Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM en
 2.  **[스택 생성]** -> **[새 리소스 사용(표준)]**을 클릭합니다.
 3.  `integrated-infra-file(osaka).yaml` 파일을 업로드합니다.
 4.  **Parameters(파라미터)** 설정:
-    * `MyIpAddress`: 본인의 PC IP 주소 입력 (관리자 접속용, 예: `121.xxx.xxx.xxx/32`)
+    * `WebClientIpAddress`: 본인의 PC 공인 IP 주소 입력 (웹 티어 서버 접속용, 예: `121.xxx.xxx.xxx/32`)
     * `DBPassword`: DB 관리자 비밀번호 설정 (8자 이상)
 5.  스택 생성 완료(CREATE_COMPLETE) 후 **Outputs** 탭에서 `WebUrl`을 확인합니다.
 6.  브라우저로 해당 URL에 접속하여 DVWA 화면을 확인합니다.
@@ -70,6 +70,7 @@ Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM en
 2.  초기 로그인 화면이 나오면 `admin` / `password` 로 로그인합니다.
 3.  좌측 메뉴 하단의 **[Setup / Reset DB]**를 클릭합니다.
 4.  **[Create / Reset Database]** 버튼을 누릅니다. (자동화 스크립트가 있지만, 확실한 실습을 위해 초기화를 권장합니다.)
+5.  잠시 연결이 끊기는 페이지가 보이긴하나, 재접속 가능하시니 걱정하지 않으셔도 됩니다.
 
 ### 2. SQL Injection Test
 이 아키텍처는 내부적으로 완벽하게 DB와 연결되어 있습니다.
@@ -85,6 +86,9 @@ Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM en
 
 * **권한 문제 (777 Permission)**: DVWA는 파일 업로드 취약점 등 다양한 공격 실습을 위해 웹 루트 디렉토리에 `777` 권한이 부여되어 있습니다. 이는 **실습용 환경(Lab)**이기에 의도된 설정이며, 실제 운영 환경에서는 절대 권장하지 않습니다.
 * **SELinux**: Amazon Linux 2023 환경에서 Apache 리버스 프록시가 정상 작동하도록 SELinux 정책(`httpd_can_network_connect`)이 UserData에 포함되어 자동 설정됩니다.
+* **리전 제약 (Region Constraint)**: 이 프로젝트는 **오사카 리전 (`ap-northeast-3`)** 전용으로 구성되었습니다. IAM 정책의 `Condition`이 오사카 리전으로 제한되어 있으므로, 타 리전 배포 시 정책 수정이 필수입니다.
+* **IAM 정책 수정 필요**: `InfraBuildTestIAMPolicy.json` 파일 내 S3 리소스 ARN이 `REPLACE-WITH-YOUR-BUCKET-NAME`으로 설정되어 있습니다. 사용 전 본인의 버킷 이름으로 수정하십시오.
+* **접속 IP 설정**: CloudFormation 배포 시 입력하는 `WebClientIpAddress`는 반드시 **공인 IP(Public IP)**여야 합니다. 사설 IP 입력 시 보안 그룹에 의해 접속이 차단됩니다.
 
 ---
 
