@@ -91,6 +91,6 @@ Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM en
 ## 👤 Author
 
 * **GitHub**: [본인의 깃허브 주소 입력]
-* **Blog**: [블로그 주소가 있다면 입력]
+* **Blog**: [https://monktech.tistory.com/]
 
 AWS 인프라 구축 및 보안 아키텍처에 관심이 많습니다. 이슈나 PR은 언제든 환영합니다!
