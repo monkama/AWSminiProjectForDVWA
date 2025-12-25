@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Layer 5 - Web Tier (External ALB + ASG with Reverse Proxy + Sticky Session)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+  # ---------------------------------------------------
+  # 1. 외부 로드밸런서 (Web-Public-ALB)
+  # ---------------------------------------------------
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Web-Public-ALB
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue Osaka-3Tier-PublicSubnet1
+        - !ImportValue Osaka-3Tier-PublicSubnet2
+      SecurityGroups:
+        - !ImportValue Osaka-3Tier-ALBSG
+
+  # ---------------------------------------------------
+  # 2. 타겟 그룹 (Web-TargetGroup) [수정됨: 스티키 세션 추가]
+  # ---------------------------------------------------
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Web-TargetGroup
+      VpcId: !ImportValue Osaka-3Tier-VpcId
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /login.php # 프록시를 타고 넘어가서 실제 앱의 로그인 페이지 확인
+      Matcher:
+        HttpCode: '200,302' # 리다이렉트(302)도 정상 응답으로 간주
+      # ▼▼▼▼▼ [추가됨] 스티키 세션 설정 (세션 끊김 방지) ▼▼▼▼▼
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400' # 1일 동안 세션 고정
+      # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+  # ---------------------------------------------------
+  # 3. 리스너 (WebListener)
+  # ---------------------------------------------------
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref WebTargetGroup}]
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ---------------------------------------------------
+  # 4. 시작 템플릿 (Apache Reverse Proxy 설정)
+  # ---------------------------------------------------
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !ImportValue Osaka-3Tier-WebSG
+        
+        UserData:
+          Fn::Base64: !Sub 
+            - |
+              #!/bin/bash
+              # 1. 아파치 설치 (sudo 사용)
+              sudo dnf update -y
+              sudo dnf install -y httpd
+              
+              # [중요] SELinux 설정 변경
+              # 웹 서버가 네트워크 연결(프록시)을 할 수 있도록 허용
+              # 이 설정이 없으면 503 에러 발생함
+              sudo setsebool -P httpd_can_network_connect 1
+
+              # 2. 리버스 프록시 설정 파일 생성 (sudo tee 사용)
+              # 들어오는 모든 요청(/)을 Internal ALB 주소로 넘김
+              cat <<EOF | sudo tee /etc/httpd/conf.d/reverse-proxy.conf
+              <VirtualHost *:80>
+                  ProxyPreserveHost On
+                  ProxyPass / http://${InternalALB}/
+                  ProxyPassReverse / http://${InternalALB}/
+              </VirtualHost>
+              EOF
+
+              # 3. 아파치 시작 (sudo 사용)
+              sudo systemctl start httpd
+              sudo systemctl enable httpd
+            - { 
+                InternalALB: !ImportValue Osaka-3Tier-InternalALB-DNS 
+              }
+
+  # ---------------------------------------------------
+  # 5. 오토 스케일링 그룹 (Web-ASG)
+  # ---------------------------------------------------
+  WebASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: Web-ASG
+      VPCZoneIdentifier:
+        # Web 서버는 Public Subnet에 배치 (DMZ 역할)
+        - !ImportValue Osaka-3Tier-PublicSubnet1
+        - !ImportValue Osaka-3Tier-PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '2'
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+
+Outputs:
+  WebUrl:
+    Value: !Sub "http://${WebLoadBalancer.DNSName}"
+    Description: Access DVWA via this URL

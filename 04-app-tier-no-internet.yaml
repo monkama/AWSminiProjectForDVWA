@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Layer 4 - App Tier (Internal ALB + ASG + DVWA + Auto DB Init + Fixes + Sticky Session)
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  
+  # Layer 3(DB) 만들 때 입력했던 비밀번호를 똑같이 입력하세요
+  DBPassword:
+    Description: Password for DB connection (Must match Layer 3 password)
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+  # ---------------------------------------------------
+  # 1. 내부 로드밸런서 (Internal ALB)
+  # ---------------------------------------------------
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: App-Internal-ALB
+      Scheme: internal
+      Subnets:
+        - !ImportValue Osaka-3Tier-PrivateAppSubnet1
+        - !ImportValue Osaka-3Tier-PrivateAppSubnet2
+      SecurityGroups:
+        - !ImportValue Osaka-3Tier-InternalALBSG
+
+  # ---------------------------------------------------
+  # 2. 타겟 그룹 (Target Group) [스티키 세션 설정 포함]
+  # ---------------------------------------------------
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: App-TargetGroup
+      VpcId: !ImportValue Osaka-3Tier-VpcId
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /setup.php
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  # ---------------------------------------------------
+  # 3. 리스너 (Listener)
+  # ---------------------------------------------------
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref AppTargetGroup}]
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ---------------------------------------------------
+  # 4. 시작 템플릿 (Launch Template)
+  # ---------------------------------------------------
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !ImportValue Osaka-3Tier-AppSG
+        
+        UserData:
+          Fn::Base64: !Sub 
+            - |
+              #!/bin/bash
+              # 1. 패키지 설치
+              sudo dnf update -y
+              sudo dnf install -y httpd php php-cli php-pdo php-mysqlnd php-gd git mariadb105
+
+              # 2. 웹 서버 및 PHP 시작
+              sudo systemctl start httpd
+              sudo systemctl enable httpd
+              sudo systemctl start php-fpm
+              sudo systemctl enable php-fpm
+
+              # 3. DVWA 다운로드
+              cd /var/www/html
+              sudo rm -f index.html
+              sudo git clone https://github.com/digininja/DVWA.git .
+              
+              # 4. 설정 파일 복사
+              sudo cp config/config.inc.php.dist config/config.inc.php
+
+              # 5. DB 접속 정보 수정
+              sudo sed -i "s/getenv('DB_SERVER') ?: '127.0.0.1'/'${RDSEndpoint}'/g" config/config.inc.php
+              sudo sed -i "s/getenv('DB_USER') ?: 'dvwa'/'admin'/g" config/config.inc.php
+              sudo sed -i "s/getenv('DB_PASSWORD') ?: 'p@ssw0rd'/'${MyDBPassword}'/g" config/config.inc.php
+
+              # 최신 DVWA 호환성 패치
+              sudo sed -i "2i \$DBMS = 'MySQL';" config/config.inc.php
+
+              # 6. 권한 설정
+              sudo chown -R apache:apache /var/www/html/
+              sudo chmod -R 777 /var/www/html/
+              
+              # 7. PHP 필수 설정 추가 (sudo tee를 사용하여 권한 문제 해결)
+              sudo tee -a /etc/php.ini <<EOF
+
+              ; DVWA Essential Settings
+              allow_url_include = On
+              allow_url_fopen = On
+              short_open_tag = On
+              display_errors = Off
+              EOF
+
+              # 8. DB 테이블 자동 생성 SQL 파일 만들기
+              sudo tee /tmp/manual_db.sql <<'SQL_SCRIPT'
+              CREATE DATABASE IF NOT EXISTS dvwa;
+              USE dvwa;
+              DROP TABLE IF EXISTS users;
+              CREATE TABLE users (
+                user_id INT(6) NOT NULL AUTO_INCREMENT,
+                first_name VARCHAR(15) DEFAULT NULL,
+                last_name VARCHAR(15) DEFAULT NULL,
+                user VARCHAR(15) DEFAULT NULL,
+                password VARCHAR(32) DEFAULT NULL,
+                avatar VARCHAR(70) DEFAULT NULL,
+                last_login TIMESTAMP NULL DEFAULT NULL,
+                failed_login INT(3) DEFAULT NULL,
+                PRIMARY KEY (user_id)
+              );
+              INSERT INTO users VALUES (1, 'admin', 'admin', 'admin', MD5('password'), '/dvwa/images/admin.jpg', NOW(), 0),
+              (2, 'Gordon', 'Brown', 'gordonb', MD5('abc123'), '/dvwa/images/gordonb.jpg', NOW(), 0),
+              (3, 'Hack', 'Me', '1337', MD5('861647437888'), '/dvwa/images/hackme.jpg', NOW(), 0),
+              (4, 'Pablo', 'Picasso', 'pablo', MD5('letmein'), '/dvwa/images/pablo.jpg', NOW(), 0),
+              (5, 'Bob', 'Smith', 'bob', MD5('password'), '/dvwa/images/bob.jpg', NOW(), 0);
+              DROP TABLE IF EXISTS guestbook;
+              CREATE TABLE guestbook (
+                comment_id SMALLINT(5) UNSIGNED NOT NULL AUTO_INCREMENT,
+                comment VARCHAR(300) DEFAULT NULL,
+                name VARCHAR(100) DEFAULT NULL,
+                PRIMARY KEY (comment_id)
+              );
+              INSERT INTO guestbook (comment, name) VALUES ('Hello DVWA!', 'admin');
+              SQL_SCRIPT
+
+              # 9. DB 초기화 실행
+              sudo mysql -h ${RDSEndpoint} -u admin -p'${MyDBPassword}' < /tmp/manual_db.sql || true
+
+              # 10. 서비스 재시작
+              sudo systemctl restart php-fpm
+              sudo systemctl restart httpd
+            - { 
+                RDSEndpoint: !ImportValue Osaka-3Tier-RDSEndpoint, 
+                MyDBPassword: !Ref DBPassword 
+              }
+
+  # ---------------------------------------------------
+  # 5. 오토 스케일링 그룹 (ASG)
+  # ---------------------------------------------------
+  AppASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: App-ASG
+      VPCZoneIdentifier:
+        - !ImportValue Osaka-3Tier-PrivateAppSubnet1
+        - !ImportValue Osaka-3Tier-PrivateAppSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '2'
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+
+Outputs:
+  InternalALBDNS:
+    Value: !GetAtt AppLoadBalancer.DNSName
+    Description: Internal ALB DNS Name
+    Export: { Name: Osaka-3Tier-InternalALB-DNS }

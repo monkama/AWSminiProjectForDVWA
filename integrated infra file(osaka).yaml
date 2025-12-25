@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: All-in-One 3-Tier Architecture (Network + SG + DB + App + Web) with DVWA
+
+Parameters:
+  # ---------------------------------------------------
+  # 1. 네트워크 및 인스턴스 설정
+  # ---------------------------------------------------
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+    Description: AMI ID for NAT, App, and Web Instances (Amazon Linux 2023)
+
+  NatInstanceType:
+    Type: String
+    Default: t3.nano
+    Description: Instance type for NAT Instance
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for Web and App Servers
+
+  # ---------------------------------------------------
+  # 2. 데이터베이스 설정
+  # ---------------------------------------------------
+  DBPassword:
+    Description: Password for DB admin (Used in RDS and App Tier)
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+  # ---------------------------------------------------
+  # 3. 접근 제어 설정
+  # ---------------------------------------------------
+  MyIpAddress:
+    Type: String
+    Description: "접속을 허용할 관리자 IP (예: 119.71.153.21/32)"
+    AllowedPattern: '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/\d{1,2}$'
+
+Mappings: 
+  VpcConfig:
+    Vpc:
+      Cidr: 172.31.0.0/16
+    PublicSubnet1: { Cidr: 172.31.0.0/24 }
+    PublicSubnet2: { Cidr: 172.31.1.0/24 }
+    PrivateAppSubnet1: { Cidr: 172.31.10.0/24 }
+    PrivateAppSubnet2: { Cidr: 172.31.11.0/24 }
+    PrivateDBSubnet1: { Cidr: 172.31.20.0/24 }
+    PrivateDBSubnet2: { Cidr: 172.31.21.0/24 }
+
+Resources:
+  # =================================================================
+  # Layer 1: Network (VPC, Subnets, IGW, NAT, Routes, EIC)
+  # =================================================================
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [VpcConfig, Vpc, Cidr]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: Osaka-VPC}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- EIC Security Group ---
+  EICEosecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 Instance Connect Endpoint
+      VpcId: !Ref MyVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PublicSubnet1, Cidr]
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PublicSubnet2, Cidr]
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PrivateAppSubnet1, Cidr]
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PrivateAppSubnet2, Cidr]
+
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      SecurityGroupIds:
+        - !Ref EICEosecurityGroup
+      Tags: [{Key: Name, Value: Osaka-EIC-Endpoint}]
+
+  # --- NAT Instance & SG ---
+  NatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT Instance
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: "-1" 
+          CidrIp: !FindInMap [VpcConfig, Vpc, Cidr]
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{Key: Name, Value: NAT-Instance-SG}]
+
+  NatInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref NatInstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref NatSecurityGroup
+      SourceDestCheck: false 
+      Tags: [{Key: Name, Value: Osaka-NAT-Instance}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo dnf install -y iptables-services
+          echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.d/custom-ip-forwarding.conf
+          sudo sysctl -p /etc/sysctl.d/custom-ip-forwarding.conf
+          interface=$(ip route show | grep default | awk '{print $5}' | head -1)
+          sudo /sbin/iptables -t nat -A POSTROUTING -o $interface -j MASQUERADE
+          sudo /sbin/iptables -F FORWARD
+          sudo service iptables save
+          sudo systemctl enable --now iptables
+
+  # --- Subnets ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PublicSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-Subnet-1}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PublicSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-Subnet-2}]
+
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateAppSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-App-Subnet-1}]
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateAppSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-App-Subnet-2}]
+
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateDBSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-DB-Subnet-1}]
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateDBSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-DB-Subnet-2}]
+
+  # --- Routing ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MyVPC }
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MyVPC }
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+  PrivateAppSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateAppSubnet1, RouteTableId: !Ref PrivateRouteTable }
+  
+  PrivateAppSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateAppSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # =================================================================
+  # Layer 2: Security Groups
+  # =================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB Access (Restricted to My IP)
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref MyIpAddress
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref MyIpAddress
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Tier Access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICEosecurityGroup
+
+  InternalALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB Access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App Tier Access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref InternalALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref EICEosecurityGroup
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database Access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # =================================================================
+  # Layer 3: Database
+  # =================================================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+
+  MyRDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: My3TierDB
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      DBName: dvwa 
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+
+  # =================================================================
+  # Layer 4: App Tier (Internal ALB + ASG + DVWA)
+  # =================================================================
+  AppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: App-Internal-ALB
+      Scheme: internal
+      Subnets:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+      SecurityGroups:
+        - !Ref InternalALBSecurityGroup
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: App-TargetGroup
+      VpcId: !Ref MyVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /setup.php
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref AppTargetGroup}]
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        
+        UserData:
+          Fn::Base64: !Sub 
+            - |
+              #!/bin/bash
+              # 1. 패키지 설치
+              sudo dnf update -y
+              sudo dnf install -y httpd php php-cli php-pdo php-mysqlnd php-gd git mariadb105
+
+              # 2. 웹 서버 및 PHP 시작
+              sudo systemctl start httpd
+              sudo systemctl enable httpd
+              sudo systemctl start php-fpm
+              sudo systemctl enable php-fpm
+
+              # 3. DVWA 다운로드
+              cd /var/www/html
+              sudo rm -f index.html
+              sudo git clone https://github.com/digininja/DVWA.git .
+              
+              # 4. 설정 파일 복사
+              sudo cp config/config.inc.php.dist config/config.inc.php
+
+              # 5. DB 접속 정보 수정
+              sudo sed -i "s/getenv('DB_SERVER') ?: '127.0.0.1'/'${RDSEndpoint}'/g" config/config.inc.php
+              sudo sed -i "s/getenv('DB_USER') ?: 'dvwa'/'admin'/g" config/config.inc.php
+              sudo sed -i "s/getenv('DB_PASSWORD') ?: 'p@ssw0rd'/'${MyDBPassword}'/g" config/config.inc.php
+
+              # 최신 DVWA 호환성 패치
+              sudo sed -i "2i \$DBMS = 'MySQL';" config/config.inc.php
+
+              # 6. 권한 설정
+              sudo chown -R apache:apache /var/www/html/
+              sudo chmod -R 777 /var/www/html/
+              
+              # 7. PHP 필수 설정 추가 (sudo tee를 사용하여 권한 문제 해결)
+              sudo tee -a /etc/php.ini <<EOF
+
+              ; DVWA Essential Settings
+              allow_url_include = On
+              allow_url_fopen = On
+              short_open_tag = On
+              display_errors = Off
+              EOF
+
+              # 8. DB 테이블 자동 생성 SQL 파일 만들기
+              sudo tee /tmp/manual_db.sql <<'SQL_SCRIPT'
+              CREATE DATABASE IF NOT EXISTS dvwa;
+              USE dvwa;
+              DROP TABLE IF EXISTS users;
+              CREATE TABLE users (
+                user_id INT(6) NOT NULL AUTO_INCREMENT,
+                first_name VARCHAR(15) DEFAULT NULL,
+                last_name VARCHAR(15) DEFAULT NULL,
+                user VARCHAR(15) DEFAULT NULL,
+                password VARCHAR(32) DEFAULT NULL,
+                avatar VARCHAR(70) DEFAULT NULL,
+                last_login TIMESTAMP NULL DEFAULT NULL,
+                failed_login INT(3) DEFAULT NULL,
+                PRIMARY KEY (user_id)
+              );
+              INSERT INTO users VALUES (1, 'admin', 'admin', 'admin', MD5('password'), '/dvwa/images/admin.jpg', NOW(), 0),
+              (2, 'Gordon', 'Brown', 'gordonb', MD5('abc123'), '/dvwa/images/gordonb.jpg', NOW(), 0),
+              (3, 'Hack', 'Me', '1337', MD5('861647437888'), '/dvwa/images/hackme.jpg', NOW(), 0),
+              (4, 'Pablo', 'Picasso', 'pablo', MD5('letmein'), '/dvwa/images/pablo.jpg', NOW(), 0),
+              (5, 'Bob', 'Smith', 'bob', MD5('password'), '/dvwa/images/bob.jpg', NOW(), 0);
+              DROP TABLE IF EXISTS guestbook;
+              CREATE TABLE guestbook (
+                comment_id SMALLINT(5) UNSIGNED NOT NULL AUTO_INCREMENT,
+                comment VARCHAR(300) DEFAULT NULL,
+                name VARCHAR(100) DEFAULT NULL,
+                PRIMARY KEY (comment_id)
+              );
+              INSERT INTO guestbook (comment, name) VALUES ('Hello DVWA!', 'admin');
+              SQL_SCRIPT
+
+              # 9. DB 초기화 실행
+              sudo mysql -h ${RDSEndpoint} -u admin -p'${MyDBPassword}' < /tmp/manual_db.sql || true
+
+              # 10. 서비스 재시작
+              sudo systemctl restart php-fpm
+              sudo systemctl restart httpd
+            - { 
+                RDSEndpoint: !GetAtt MyRDS.Endpoint.Address, 
+                MyDBPassword: !Ref DBPassword 
+              }
+
+  AppASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: App-ASG
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnet1
+        - !Ref PrivateAppSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '2'
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+
+  # =================================================================
+  # Layer 5: Web Tier (External ALB + ASG + Reverse Proxy)
+  # =================================================================
+  WebLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Web-Public-ALB
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Web-TargetGroup
+      VpcId: !Ref MyVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /login.php 
+      Matcher:
+        HttpCode: '200,302'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  WebListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref WebTargetGroup}]
+      LoadBalancerArn: !Ref WebLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref WebSecurityGroup
+        
+        UserData:
+          Fn::Base64: !Sub 
+            - |
+              #!/bin/bash
+              # 1. 아파치 설치 (sudo 사용)
+              sudo dnf update -y
+              sudo dnf install -y httpd
+              
+              # [중요] SELinux 설정 변경
+              # 웹 서버가 네트워크 연결(프록시)을 할 수 있도록 허용
+              # 이 설정이 없으면 503 에러 발생함
+              sudo setsebool -P httpd_can_network_connect 1
+
+              # 2. 리버스 프록시 설정 파일 생성 (sudo tee 사용)
+              # 들어오는 모든 요청(/)을 Internal ALB 주소로 넘김
+              cat <<EOF | sudo tee /etc/httpd/conf.d/reverse-proxy.conf
+              <VirtualHost *:80>
+                  ProxyPreserveHost On
+                  ProxyPass / http://${InternalALB}/
+                  ProxyPassReverse / http://${InternalALB}/
+              </VirtualHost>
+              EOF
+
+              # 3. 아파치 시작 (sudo 사용)
+              sudo systemctl start httpd
+              sudo systemctl enable httpd
+            - { 
+                InternalALB: !GetAtt AppLoadBalancer.DNSName 
+              }
+
+  WebASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: Web-ASG
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: '2'
+      MaxSize: '2'
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+
+Outputs:
+  WebUrl:
+    Value: !Sub "http://${WebLoadBalancer.DNSName}"
+    Description: Access DVWA via this URL
+  InternalALBDNS:
+    Value: !GetAtt AppLoadBalancer.DNSName
+    Description: Internal ALB DNS Name
+  RDSEndpoint:
+    Description: RDS Endpoint Address
+    Value: !GetAtt MyRDS.Endpoint.Address
+  NatInstanceId:
+    Value: !Ref NatInstance
+    Description: NAT Instance ID

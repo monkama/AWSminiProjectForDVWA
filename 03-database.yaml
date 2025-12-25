@@ -1,0 +1,54 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Layer 3 - Database (RDS MySQL for DVWA)
+
+Parameters:
+  DBPassword:
+    Description: Password for DB admin
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+  # 1. 서브넷 그룹 (DB가 배치될 2개의 프라이빗 서브넷)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS
+      SubnetIds:
+        - !ImportValue Osaka-3Tier-PrivateDBSubnet1
+        - !ImportValue Osaka-3Tier-PrivateDBSubnet2
+
+  # 2. RDS 인스턴스 본체
+  MyRDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete # 스택 삭제 시 DB도 쿨하게 삭제 (실습용)
+    Properties:
+      DBInstanceIdentifier: My3TierDB
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      
+      # 계정 정보
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBPassword
+      
+      # [추가됨] DVWA용 빈 데이터베이스 미리 생성
+      DBName: dvwa 
+      
+      # 네트워크 설정
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue Osaka-3Tier-DBSG # EIC 접속 허용된 SG 적용됨
+      
+      # 보안 및 가용성
+      MultiAZ: false
+      PubliclyAccessible: false
+
+# [추가됨] DB 접속 주소를 밖으로 알려줌
+Outputs:
+  RDSEndpoint:
+    Description: RDS Endpoint Address
+    Value: !GetAtt MyRDS.Endpoint.Address
+    Export: { Name: Osaka-3Tier-RDSEndpoint }
