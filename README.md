@@ -1,6 +1,6 @@
 # AWSminiProjectForDVWA
 Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM environments with auto-deployed DVWA for security testing.
-# 🛡️ Secure AWS 3-Tier Architecture with DVWA (CloudFormation)
+# AWS 3-Tier Architecture with DVWA (CloudFormation)
 
 이 프로젝트는 **AWS CloudFormation**을 사용하여 **보안이 강화된 3-Tier 아키텍처(Web-App-DB)**를 자동으로 구축하는 IaC(Infrastructure as Code) 프로젝트입니다.
 
