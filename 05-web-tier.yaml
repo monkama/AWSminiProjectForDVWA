@@ -112,8 +112,9 @@ Resources:
       LaunchTemplate:
         LaunchTemplateId: !Ref WebLaunchTemplate
         Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
-      MinSize: '2'
+      MinSize: '1'
       MaxSize: '2'
+      DesiredCapacity: '2'
       TargetGroupARNs:
         - !Ref WebTargetGroup
 
