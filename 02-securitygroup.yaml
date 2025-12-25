@@ -1,13 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Layer 2 - Security Groups (My IP Only + EIC SG Reference)
+Description: Layer 2 - Security Groups (HTTP Only, No Admin IP Required)
 
 Parameters:
-  MyIpAddress:
+  WebClientIpAddress:
     Type: String
-    Description: "접속을 허용할 관리자 IP"
+    Description: "웹 서비스 접속 허용 IP (전세계 허용 시 0.0.0.0/0)"
     AllowedPattern: '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/\d{1,2}$'
-
-  # [삭제됨] VpcCidr 파라미터는 더 이상 필요 없습니다. (SG 참조 방식 사용)
+    Default: "0.0.0.0/0"
 
 Resources:
   # ---------------------------------------------------
@@ -16,19 +15,14 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Public ALB Access (Restricted to My IP)
+      GroupDescription: Public ALB Access (Web Client Only, HTTP)
       VpcId: !ImportValue Osaka-3Tier-VpcId
       SecurityGroupIngress:
-        # [HTTP 80] 사용자님 IP만 허용
+        # [HTTP 80] 웹 클라이언트 IP 허용
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: !Ref MyIpAddress
-        # [HTTPS 443] 사용자님 IP만 허용
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref MyIpAddress
+          CidrIp: !Ref WebClientIpAddress
 
   # ---------------------------------------------------
   # 2. Web 서버용 SG
@@ -45,8 +39,7 @@ Resources:
           ToPort: 80
           SourceSecurityGroupId: !Ref ALBSecurityGroup
         
-        # [관리] EIC 보안 그룹에서의 SSH 접속만 허용 (보안 강화!)
-        # IP 대역이 아니라 'EIC 딱지'가 붙은 트래픽만 통과시킴
+        # [관리] EIC 보안 그룹에서의 SSH 접속만 허용
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -102,8 +95,6 @@ Resources:
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref AppSecurityGroup
-        
-        # [확인] RDS는 SSH 접속 불가하므로 22번 규칙 없음 (잘 하셨습니다!)
 
 Outputs:
   ALBSG:
