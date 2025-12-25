@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Layer 1 - Network (VPC, Subnets, IGW, NAT Instance, EIC Endpoint)
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+    Description: NAT Instance AMI (Amazon Linux 2023)
+
+  NatInstanceType:
+    Type: String
+    Default: t3.nano
+    Description: Instance type for NAT Instance
+
+Mappings: 
+  VpcConfig:
+    Vpc:
+      Cidr: 172.31.0.0/16
+    PublicSubnet1: { Cidr: 172.31.0.0/24 }
+    PublicSubnet2: { Cidr: 172.31.1.0/24 }
+    PrivateAppSubnet1: { Cidr: 172.31.10.0/24 }
+    PrivateAppSubnet2: { Cidr: 172.31.11.0/24 }
+    PrivateDBSubnet1: { Cidr: 172.31.20.0/24 }
+    PrivateDBSubnet2: { Cidr: 172.31.21.0/24 }
+
+Resources:
+  # 1. VPC 생성
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [VpcConfig, Vpc, Cidr]
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{Key: Name, Value: Osaka-VPC}]
+
+  # 2. 인터넷 게이트웨이 (IGW)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # 3. EC2 Instance Connect Endpoint (EIC) 보안 그룹
+  EICEosecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 Instance Connect Endpoint
+      VpcId: !Ref MyVPC
+      SecurityGroupEgress:
+        # 1) NAT 인스턴스 접속용 (Public Subnet 1)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PublicSubnet1, Cidr]
+        
+        # [추가됨] 2) Public Subnet 2 접속용 (혹시 모를 인스턴스 대비)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PublicSubnet2, Cidr]
+
+        # 3) App/Web 서버 접속용 (Private App Subnet 1)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PrivateAppSubnet1, Cidr]
+        
+        # 4) App/Web 서버 접속용 (Private App Subnet 2)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !FindInMap [VpcConfig, PrivateAppSubnet2, Cidr]
+        
+        # (참고) DB 서브넷은 SSH 접속 대상이 아니므로 제외함
+
+  # 4. EC2 Instance Connect Endpoint
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      SecurityGroupIds:
+        - !Ref EICEosecurityGroup
+      Tags:
+        - Key: Name
+          Value: Osaka-EIC-Endpoint
+
+  # 5. NAT 인스턴스용 보안 그룹
+  NatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT Instance
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        # VPC 내부에서 오는 모든 트래픽 허용
+        - IpProtocol: "-1" 
+          CidrIp: !FindInMap [VpcConfig, Vpc, Cidr]
+      SecurityGroupEgress:
+        # 외부로 나가는 모든 트래픽 허용
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{Key: Name, Value: NAT-Instance-SG}]
+
+  # 6. NAT 인스턴스
+  NatInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref NatInstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref NatSecurityGroup
+      SourceDestCheck: false 
+      Tags:
+        - Key: Name
+          Value: Osaka-NAT-Instance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo dnf install -y iptables-services
+          echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.d/custom-ip-forwarding.conf
+          sudo sysctl -p /etc/sysctl.d/custom-ip-forwarding.conf
+          interface=$(ip route show | grep default | awk '{print $5}' | head -1)
+          sudo /sbin/iptables -t nat -A POSTROUTING -o $interface -j MASQUERADE
+          sudo /sbin/iptables -F FORWARD
+          sudo service iptables save
+          sudo systemctl enable --now iptables
+
+  # --- 서브넷 생성 ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PublicSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-Subnet-1}]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PublicSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: Public-Subnet-2}]
+
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateAppSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-App-Subnet-1}]
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateAppSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-App-Subnet-2}]
+
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateDBSubnet1, Cidr]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-DB-Subnet-1}]
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !FindInMap [VpcConfig, PrivateDBSubnet2, Cidr]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: Private-DB-Subnet-2}]
+
+  # --- 라우팅 테이블 ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MyVPC }
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  # [NAT 인스턴스로 향하는 라우팅]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MyVPC }
+
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+  PrivateAppSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateAppSubnet1, RouteTableId: !Ref PrivateRouteTable }
+  
+  PrivateAppSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateAppSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+Outputs:
+  VpcId:
+    Value: !Ref MyVPC
+    Export: { Name: Osaka-3Tier-VpcId }
+  PublicSubnet1:
+    Value: !Ref PublicSubnet1
+    Export: { Name: Osaka-3Tier-PublicSubnet1 }
+  PublicSubnet2:
+    Value: !Ref PublicSubnet2
+    Export: { Name: Osaka-3Tier-PublicSubnet2 }
+  PrivateAppSubnet1:
+    Value: !Ref PrivateAppSubnet1
+    Export: { Name: Osaka-3Tier-PrivateAppSubnet1 }
+  PrivateAppSubnet2:
+    Value: !Ref PrivateAppSubnet2
+    Export: { Name: Osaka-3Tier-PrivateAppSubnet2 }
+  PrivateDBSubnet1:
+    Value: !Ref PrivateDBSubnet1
+    Export: { Name: Osaka-3Tier-PrivateDBSubnet1 }
+  PrivateDBSubnet2:
+    Value: !Ref PrivateDBSubnet2
+    Export: { Name: Osaka-3Tier-PrivateDBSubnet2 }
+  NatInstanceId:
+    Value: !Ref NatInstance
+    Description: NAT Instance ID
+    Export: { Name: Osaka-NatInstance-Id }
+  # [중요] Layer 2에서 EIC 보안 그룹을 참조하기 위해 Export 추가됨
+  EICSG:
+    Value: !Ref EICEosecurityGroup
+    Export: { Name: Osaka-3Tier-EICSG }
