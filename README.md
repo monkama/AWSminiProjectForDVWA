@@ -6,6 +6,9 @@ Secure 3-Tier Architecture on AWS via CloudFormation. Designed for strict IAM en
 
 특히, **엄격한 IAM 권한 제한이 있는 환경**에서도 배포가 가능하도록 설계되었으며, **DVWA(Damn Vulnerable Web App)**를 통해 웹 해킹 및 보안 실습을 바로 진행할 수 있는 환경을 제공합니다.
 
+<img width="1514" height="1266" alt="image" src="https://github.com/user-attachments/assets/45e1d4e0-ca99-4590-84f4-381243870107" />
+
+
 ---
 
 ## 🏗️ Architecture Overview
